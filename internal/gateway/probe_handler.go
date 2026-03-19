@@ -426,7 +426,7 @@ func probeExecRESTFetch(req ProbeRequest) ProbeResponse {
 		return ProbeResponse{ID: req.ID, Error: err.Error()}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
 	data, _ := json.Marshal(map[string]any{"status_code": resp.StatusCode, "body": string(body)})
 	return ProbeResponse{ID: req.ID, Success: true, Result: data}
 }
@@ -453,7 +453,7 @@ func probeExecRESTInspect(req ProbeRequest) ProbeResponse {
 		if err != nil {
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 4*1024))
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1024))
 		r.Body.Close()
 		if r.StatusCode < 400 {
 			found = append(found, ep{Path: e, Status: r.StatusCode, Body: string(body)})
