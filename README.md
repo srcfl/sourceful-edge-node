@@ -13,25 +13,33 @@ Universal Sourceful edge node — one Go binary that turns any machine into a ga
 ## Quick Start
 
 ```bash
-# Build
-go build -o edge-node ./cmd/edge-node/
+make build                # → bin/edge-node
+make build-all            # Cross-compile all platforms
+make test                 # Run tests
 
-# Run with embedded NATS (standalone)
-./edge-node
+# Standalone (embedded NATS)
+./bin/edge-node
 
-# Connect to Sourceful testnet
-./edge-node --nats-url wss://novacore-testnet.sourceful.dev:4443
+# Connect to Sourceful testnet (embedded NATS + leaf node)
+./bin/edge-node --nats-embed --nats-leaf-url wss://novacore-testnet.sourceful.dev:4443
 
 # With device drivers
-./edge-node --nats-url wss://novacore-testnet.sourceful.dev:4443 --drivers ./drivers/
+./bin/edge-node --nats-embed --nats-leaf-url wss://novacore-testnet.sourceful.dev:4443 --drivers ./drivers/
+
+# Test with Hugin (Hugin connects to edge-node's embedded NATS)
+./bin/edge-node --nats-embed --nats-leaf-url wss://novacore-testnet.sourceful.dev:4443
+# In another terminal:
+cd ../sourceful-hugin && ./bin/hugin --gateway --develop --nats-url nats://127.0.0.1:4222
 ```
 
 ## Configuration
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--nats-url` | `SOURCEFUL_NATS_URL` | embedded | NovaCore NATS URL |
-| `--nats-embed` | | false | Run embedded NATS server |
+| `--nats-url` | `SOURCEFUL_NATS_URL` | embedded | Direct NATS URL (requires registered identity) |
+| `--nats-embed` | | false | Run embedded NATS server (recommended) |
+| `--nats-leaf-url` | | | Upstream NATS for leaf node (with --nats-embed) |
+| `--nats-creds` | | | NATS credentials file for upstream auth |
 | `--data-dir` | `SOURCEFUL_DATA_DIR` | `~/.sourceful/` | Data directory |
 | `--drivers` | | auto-detect | Path to device drivers |
 | `--devices` | | `{data-dir}/devices.json` | Device configuration |

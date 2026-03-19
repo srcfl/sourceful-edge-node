@@ -56,13 +56,16 @@ func NewFleetMonitor(nc *nats.Conn, ownSerial string) (*FleetMonitor, error) {
 		probeWaiters: make(map[string]chan json.RawMessage),
 	}
 
-	// Subscribe to all gateway telemetry and state
+	// Subscribe to all gateway telemetry and state.
+	// Set pending limits to avoid slow consumer — drop excess messages
+	// rather than blocking the NATS connection.
 	sub, err := nc.Subscribe("gateways.>", func(msg *nats.Msg) {
 		fm.handleMessage(msg)
 	})
 	if err != nil {
 		return nil, err
 	}
+	sub.SetPendingLimits(256, 16*1024*1024) // 256 msgs or 16MB
 	fm.sub = sub
 
 	log.Printf("Fleet monitor: subscribed to gateways.>")
@@ -72,7 +75,7 @@ func NewFleetMonitor(nc *nats.Conn, ownSerial string) (*FleetMonitor, error) {
 func (fm *FleetMonitor) handleMessage(msg *nats.Msg) {
 	// Parse subject: gateways.{serial}.devices.{deviceID}.ders.{derType}.telemetry.json.v1
 	// Or: gateways.{serial}.state.json.v1
-	// Or: gateways.{serial}.logs.*
+	// Or: gateways.{serial}.hugin.responses
 	parts := strings.Split(msg.Subject, ".")
 	if len(parts) < 2 {
 		return
@@ -81,6 +84,13 @@ func (fm *FleetMonitor) handleMessage(msg *nats.Msg) {
 
 	// Skip our own telemetry
 	if gwSerial == fm.serial {
+		return
+	}
+
+	// Dispatch probe responses BEFORE taking the fleet lock — probe dispatch
+	// uses its own probeMu and must not be blocked by slow fleet updates.
+	if len(parts) >= 4 && parts[2] == "hugin" && parts[3] == "responses" {
+		fm.dispatchProbeResponse(msg.Data)
 		return
 	}
 
@@ -95,41 +105,39 @@ func (fm *FleetMonitor) handleMessage(msg *nats.Msg) {
 		}
 		fm.gateways[gwSerial] = gw
 	}
-	// Dispatch probe responses: gateways.{serial}.hugin.responses
-	if len(parts) >= 4 && parts[2] == "hugin" && parts[3] == "responses" {
-		fm.dispatchProbeResponse(msg.Data)
+
+	// Track state messages to discover gateways (even with 0 devices)
+	if len(parts) >= 3 && parts[2] == "state" {
+		gw.LastSeen = time.Now()
 		return
 	}
 
-	// Only track telemetry messages, ignore logs/state/events
+	// Only track telemetry for device/DER data
 	if len(parts) < 7 || parts[2] != "devices" || parts[4] != "ders" || parts[6] != "telemetry" {
 		return
 	}
 
-	// Parse telemetry: gateways.{serial}.devices.{deviceID}.ders.{derType}.telemetry.json.v1
-	{
-		gw.LastSeen = time.Now()
+	gw.LastSeen = time.Now()
 
-		deviceID := parts[3]
-		derType := parts[5]
+	deviceID := parts[3]
+	derType := parts[5]
 
-		dev, exists := gw.Devices[deviceID]
-		if !exists {
-			dev = &DeviceState{
-				DeviceID: deviceID,
-				DERs:     make(map[string]*DERState),
-			}
-			gw.Devices[deviceID] = dev
+	dev, exists := gw.Devices[deviceID]
+	if !exists {
+		dev = &DeviceState{
+			DeviceID: deviceID,
+			DERs:     make(map[string]*DERState),
 		}
-		dev.LastSeen = time.Now()
+		gw.Devices[deviceID] = dev
+	}
+	dev.LastSeen = time.Now()
 
-		var data map[string]any
-		if err := json.Unmarshal(msg.Data, &data); err == nil {
-			dev.DERs[derType] = &DERState{
-				DERType:   derType,
-				Data:      data,
-				Timestamp: time.Now(),
-			}
+	var data map[string]any
+	if err := json.Unmarshal(msg.Data, &data); err == nil {
+		dev.DERs[derType] = &DERState{
+			DERType:   derType,
+			Data:      data,
+			Timestamp: time.Now(),
 		}
 	}
 }

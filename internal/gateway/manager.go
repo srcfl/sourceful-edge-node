@@ -54,6 +54,10 @@ func NewDeviceManager(serial string, nc *nats.Conn, ds *drivers.Store, dataDir, 
 
 // Start loads device config and starts all device runtimes.
 func (dm *DeviceManager) Start(ctx context.Context) error {
+	// Always start gateway state publisher — even with 0 devices,
+	// state messages are needed for fleet monitor discovery.
+	go dm.publishState(ctx)
+
 	cfg, err := LoadDevicesConfig(dm.configPath)
 	if err != nil {
 		return fmt.Errorf("load devices config: %w", err)
@@ -76,9 +80,6 @@ func (dm *DeviceManager) Start(ctx context.Context) error {
 	}
 
 	log.Printf("DeviceManager started %d devices", len(dm.devices))
-
-	// Start gateway state publisher
-	go dm.publishState(ctx)
 
 	return nil
 }
