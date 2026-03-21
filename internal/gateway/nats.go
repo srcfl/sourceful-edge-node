@@ -97,13 +97,25 @@ func ConnectNATS(cfg NATSConfig, id *identity.Identity) (*NATSConn, error) {
 		nats.ReconnectHandler(func(_ *nats.Conn) {
 			log.Println("NATS reconnected")
 		}),
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			if sub != nil {
+				log.Printf("NATS async error on %s: %v", sub.Subject, err)
+			} else {
+				log.Printf("NATS async error: %v", err)
+			}
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			log.Println("NATS connection closed")
+		}),
+		// Detect stale connections faster with aggressive pings
+		nats.PingInterval(30 * time.Second),
+		nats.MaxPingsOutstanding(3),
 	}
 
 	// Auth: credentials file or ES256 JWT (username=serial, password=jwt)
 	if cfg.Creds != "" && !cfg.Embed {
 		natsOpts = append(natsOpts, nats.UserCredentials(cfg.Creds))
 	} else if id.PrivateKey != nil && !cfg.Embed {
-		// NovaCore auth-callout reads ConnectOpts.User + ConnectOpts.Pass
 		jwt, err := id.GenerateAuthJWT()
 		if err != nil {
 			return nil, fmt.Errorf("generate auth JWT: %w", err)
@@ -114,6 +126,26 @@ func ConnectNATS(cfg NATSConfig, id *identity.Identity) (*NATSConn, error) {
 	conn, err := nats.Connect(connectURL, natsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("NATS connect to %s: %w", connectURL, err)
+	}
+
+	// If using JWT auth, refresh the password on disconnect so the reconnect
+	// attempt uses a fresh JWT. The JWT expires after 5 minutes — without
+	// refresh, reconnection after expiry fails silently.
+	if id.PrivateKey != nil && !cfg.Embed && cfg.Creds == "" {
+		conn.SetDisconnectErrHandler(func(c *nats.Conn, err error) {
+			if err != nil {
+				log.Printf("NATS disconnected: %v", err)
+			}
+			newJWT, jwtErr := id.GenerateAuthJWT()
+			if jwtErr != nil {
+				log.Printf("NATS: JWT refresh failed: %v", jwtErr)
+				return
+			}
+			c.Opts.Password = newJWT
+		})
+		conn.SetReconnectHandler(func(_ *nats.Conn) {
+			log.Println("NATS reconnected (JWT refreshed)")
+		})
 	}
 
 	nc.Conn = conn
