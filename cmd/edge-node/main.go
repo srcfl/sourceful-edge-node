@@ -118,7 +118,7 @@ func main() {
 	}
 
 	// Probe handler — makes this binary controllable by Hugin
-	if err := gateway.StartProbeHandler(nc.Conn, id.Serial); err != nil {
+	if err := gateway.StartProbeHandler(nc.Conn, id.Serial, ds); err != nil {
 		log.Printf("Warning: probe handler: %v", err)
 	}
 

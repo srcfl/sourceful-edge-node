@@ -12,18 +12,34 @@ import (
 	"sync"
 	"time"
 
+	"context"
+
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/nats-io/nats.go"
+	"github.com/srcfl/sourceful-edge-node/internal/drivers"
+	"github.com/srcfl/sourceful-edge-node/internal/luarunner"
 	"github.com/srcfl/sourceful-edge-node/internal/messaging"
 	"github.com/srcfl/sourceful-edge-node/internal/modbus"
 )
 
 // ProbeRequest is received from Hugin via NATS.
 type ProbeRequest struct {
-	ID      string          `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-	ReplyTo string          `json:"reply_to,omitempty"`
+	ID         string          `json:"id"`
+	Method     string          `json:"method"`
+	Params     json.RawMessage `json:"params"`
+	ReplyTo    string          `json:"reply_to,omitempty"`
+	ProgressTo string          `json:"progress_to,omitempty"`
+}
+
+// probeProgressFn creates a function that publishes progress to NATS.
+func probeProgressFn(nc *nats.Conn, progressTo string) func(string) {
+	if progressTo == "" || nc == nil {
+		return nil
+	}
+	return func(status string) {
+		data, _ := json.Marshal(map[string]string{"status": status})
+		nc.Publish(progressTo, data)
+	}
 }
 
 // ProbeResponse is returned to Hugin.
@@ -37,14 +53,20 @@ type ProbeResponse struct {
 // StartProbeHandler subscribes to Hugin probe requests on NATS
 // and executes them locally. This turns the binary into an edge node
 // that can be remotely controlled by another Hugin instance.
-func StartProbeHandler(nc *nats.Conn, serial string) error {
+// Optional ds enables deploy_driver and run_driver.
+func StartProbeHandler(nc *nats.Conn, serial string, ds ...*drivers.Store) error {
 	if nc == nil {
 		return fmt.Errorf("NATS not connected")
 	}
 
+	var driverStore *drivers.Store
+	if len(ds) > 0 {
+		driverStore = ds[0]
+	}
+
 	subject := messaging.HuginProbeSubject(serial)
 	_, err := nc.Subscribe(subject, func(msg *nats.Msg) {
-		handleProbeRequest(nc, msg)
+		handleProbeRequest(nc, msg, driverStore)
 	})
 	if err != nil {
 		return err
@@ -54,7 +76,7 @@ func StartProbeHandler(nc *nats.Conn, serial string) error {
 	return nil
 }
 
-func handleProbeRequest(nc *nats.Conn, msg *nats.Msg) {
+func handleProbeRequest(nc *nats.Conn, msg *nats.Msg, ds *drivers.Store) {
 	var req ProbeRequest
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		respondProbe(nc, msg, req, ProbeResponse{Error: "invalid request"})
@@ -62,6 +84,7 @@ func handleProbeRequest(nc *nats.Conn, msg *nats.Msg) {
 	}
 
 	log.Printf("[probe] %s id=%s", req.Method, req.ID)
+	progress := probeProgressFn(nc, req.ProgressTo)
 
 	var resp ProbeResponse
 	resp.ID = req.ID
@@ -74,9 +97,9 @@ func handleProbeRequest(nc *nats.Conn, msg *nats.Msg) {
 	case "read_registers":
 		resp = probeExecReadRegisters(req)
 	case "scan_register_range":
-		resp = probeExecScanRange(req)
+		resp = probeExecScanRange(req, progress)
 	case "network_scan":
-		resp = probeExecNetworkScan(req)
+		resp = probeExecNetworkScan(req, progress)
 	case "rest_fetch":
 		resp = probeExecRESTFetch(req)
 	case "rest_inspect":
@@ -85,6 +108,10 @@ func handleProbeRequest(nc *nats.Conn, msg *nats.Msg) {
 		resp = probeExecMQTTConnect(req)
 	case "mqtt_subscribe":
 		resp = probeExecMQTTSubscribe(req)
+	case "run_driver":
+		resp = probeExecRunDriver(req, progress)
+	case "deploy_driver":
+		resp = probeExecDeployDriver(req, ds)
 	case "list_devices":
 		resp = ProbeResponse{ID: req.ID, Success: true, Result: json.RawMessage(`{"count":0,"devices":[]}`)}
 	default:
@@ -254,7 +281,7 @@ func probeExecReadRegisters(req ProbeRequest) ProbeResponse {
 	return ProbeResponse{ID: req.ID, Success: true, Result: data}
 }
 
-func probeExecScanRange(req ProbeRequest) ProbeResponse {
+func probeExecScanRange(req ProbeRequest, progress func(string)) ProbeResponse {
 	var p struct {
 		Host         string `json:"host"`
 		Port         int    `json:"port"`
@@ -291,10 +318,16 @@ func probeExecScanRange(req ProbeRequest) ProbeResponse {
 	}
 	var found []entry
 	chunk := 50
+	totalChunks := (p.End - p.Start + chunk) / chunk
+	chunkNum := 0
 	for addr := p.Start; addr <= p.End; addr += chunk {
+		chunkNum++
 		count := chunk
 		if addr+count-1 > p.End {
 			count = p.End - addr + 1
+		}
+		if progress != nil {
+			progress(fmt.Sprintf("read %s %d-%d [%d/%d] %d found", regType, addr, addr+count-1, chunkNum, totalChunks, len(found)))
 		}
 		var raw []byte
 		if regType == "input" {
@@ -320,7 +353,7 @@ func probeExecScanRange(req ProbeRequest) ProbeResponse {
 	return ProbeResponse{ID: req.ID, Success: true, Result: data}
 }
 
-func probeExecNetworkScan(req ProbeRequest) ProbeResponse {
+func probeExecNetworkScan(req ProbeRequest, progress func(string)) ProbeResponse {
 	var p struct {
 		Subnet  string `json:"subnet"`
 		Ports   []int  `json:"ports"`
@@ -399,6 +432,9 @@ func probeExecNetworkScan(req ProbeRequest) ProbeResponse {
 	var found []result
 	for r := range results {
 		found = append(found, r)
+		if progress != nil {
+			progress(fmt.Sprintf("found %s:%d (%d total)", r.Host, r.Port, len(found)))
+		}
 	}
 
 	data, _ := json.Marshal(map[string]any{
@@ -557,5 +593,91 @@ func probeExecMQTTSubscribe(req ProbeRequest) ProbeResponse {
 	result := samples
 	mu.Unlock()
 	data, _ := json.Marshal(map[string]any{"topic_pattern": p.Topic, "message_count": len(result), "sample_messages": result})
+	return ProbeResponse{ID: req.ID, Success: true, Result: data}
+}
+
+func probeExecRunDriver(req ProbeRequest, progress func(string)) ProbeResponse {
+	var p struct {
+		Source   string `json:"source"`
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		SlaveID  int    `json:"slave_id"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	json.Unmarshal(req.Params, &p)
+	if p.Source == "" {
+		return ProbeResponse{ID: req.ID, Error: "source is required"}
+	}
+
+	if progress != nil {
+		progress("initializing Lua VM...")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	target := luarunner.TargetConfig{
+		Host:     p.Host,
+		Port:     p.Port,
+		SlaveID:  p.SlaveID,
+		Username: p.Username,
+		Password: p.Password,
+	}
+
+	if progress != nil {
+		progress(fmt.Sprintf("running driver against %s:%d...", p.Host, p.Port))
+	}
+
+	result := luarunner.RunDriver(ctx, p.Source, target)
+
+	if progress != nil {
+		if result.Success {
+			progress(fmt.Sprintf("driver OK: %d emissions", len(result.Emissions)))
+		} else if len(result.Errors) > 0 {
+			progress("driver error: " + result.Errors[0])
+		}
+	}
+
+	data, _ := json.Marshal(result)
+	return ProbeResponse{ID: req.ID, Success: true, Result: data}
+}
+
+func probeExecDeployDriver(req ProbeRequest, ds *drivers.Store) ProbeResponse {
+	var p struct {
+		Name     string `json:"name"`
+		Source   string `json:"source"`
+		Manifest string `json:"manifest"`
+	}
+	json.Unmarshal(req.Params, &p)
+
+	if p.Name == "" || p.Source == "" {
+		return ProbeResponse{ID: req.ID, Error: "name and source required"}
+	}
+
+	if ds == nil {
+		return ProbeResponse{ID: req.ID, Error: "driver store not available"}
+	}
+
+	var manifest drivers.Manifest
+	if p.Manifest != "" {
+		json.Unmarshal([]byte(p.Manifest), &manifest)
+	}
+	if manifest.Name == "" {
+		manifest.Name = p.Name
+	}
+	if manifest.Protocol == "" {
+		manifest.Protocol = "modbus"
+	}
+	if len(manifest.DERs) == 0 {
+		manifest.DERs = []string{"meter"}
+	}
+
+	if err := ds.CreateDriver(p.Name, manifest, p.Source); err != nil {
+		return ProbeResponse{ID: req.ID, Error: "save driver: " + err.Error()}
+	}
+
+	log.Printf("[probe] Deployed driver %s", p.Name)
+	data, _ := json.Marshal(map[string]any{"name": p.Name, "status": "deployed"})
 	return ProbeResponse{ID: req.ID, Success: true, Result: data}
 }
